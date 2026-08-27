@@ -1,6 +1,6 @@
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, updatePassword, reauthenticateWithCredential, EmailAuthProvider } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-        import { getFirestore, collection, addDoc, getDocs, query, orderBy, deleteDoc, doc, updateDoc, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+        import { getFirestore, collection, addDoc, getDocs, query, orderBy, deleteDoc, doc, updateDoc, setDoc, getDoc, runTransaction } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyDaVsm4cs9O-R0plj1hk62Iy1uU2IYZLfc",
@@ -1665,7 +1665,35 @@
             mostrarModalPreviewPDF(blobUrl, `INVENTARIO_${repoLimpio}_${lote.fecha}.pdf`);
         };
 
-        window.guardarReingreso = async function() {
+        // Contador atómico transaccional: evita colisiones de correlativo cuando
+        // dos personas guardan casi al mismo tiempo, y crea el documento del
+        // reingreso dentro de la MISMA transacción, así el correlativo asignado
+        // siempre corresponde a un registro que sí quedó grabado en Firestore.
+        async function guardarReingresoConCorrelativoAtomico(datosBase) {
+            const contadorRef = doc(db, "contadores", "reingresos");
+            const nuevoDocRef = doc(collection(db, "reingresos"));
+
+            const resultado = await runTransaction(db, async (transaction) => {
+                const contadorSnap = await transaction.get(contadorRef);
+                const nuevoValor = (contadorSnap.exists() ? Number(contadorSnap.data().valor) || 0 : 0) + 1;
+
+                const datosCompletos = { ...datosBase, correlativo: nuevoValor };
+
+                transaction.set(contadorRef, { valor: nuevoValor });
+                transaction.set(nuevoDocRef, datosCompletos);
+
+                return { id: nuevoDocRef.id, correlativo: nuevoValor, datos: datosCompletos };
+            });
+
+            return resultado;
+        }
+
+        // Función única para reingresos: guarda primero en Firestore (con
+        // correlativo atómico si es un registro nuevo) y solo después genera
+        // el PDF con los datos ya confirmados en la base de datos. Así se evita
+        // el desfase entre "Generar PDF" y "Guardar Registro" que producía
+        // correlativos fantasma cuando el guardado nunca se completaba.
+        async function procesarYGuardarReingreso() {
             const expedientes = Array.from(document.querySelectorAll("#tabla-reingresos tbody tr")).map(tr => {
                 const inputs = tr.querySelectorAll('input, select');
                 return { paquete: inputs[0].value, exp: inputs[1].value, folios: inputs[2].value, juzgado: inputs[3].value, tipo: inputs[4].value, acomp: inputs[5].value };
@@ -1676,17 +1704,24 @@
                 return;
             }
 
+            const btnGuardar = document.getElementById('btn-guardar-reingreso');
+            const btnGenerarPDF = document.querySelector('button[onclick="generarReporteReingresoPDF()"]');
+            [btnGuardar, btnGenerarPDF].forEach(b => b?.setAttribute('disabled', 'true'));
+
             try {
                 const currentUserObj = auth.currentUser;
                 const currentUserName = currentUserObj ? (currentUserObj.displayName ? normalizarTexto(currentUserObj.displayName) : normalizarTexto(currentUserObj.email.split('@')[0])) : 'DESCONOCIDO';
 
+                const fecha = document.getElementById('re-fecha').value;
+                const solicitante = document.getElementById('re-solicitante').value;
+                const local = document.getElementById('re-local').value;
+                const entregado = document.getElementById('re-entregado').value;
+
+                let correlativoFinal, datosParaPDF;
+
                 if (idReingresoEnEdicion) {
                     const datosActualizados = {
-                        fecha: document.getElementById('re-fecha').value,
-                        solicitante: document.getElementById('re-solicitante').value,
-                        local: document.getElementById('re-local').value,
-                        entregado: document.getElementById('re-entregado').value,
-                        expedientes,
+                        fecha, solicitante, local, entregado, expedientes,
                         auditoriaEdicion: {
                             uid: currentUserObj?.uid || null,
                             nombre: currentUserName,
@@ -1695,16 +1730,13 @@
                     };
 
                     await updateDoc(doc(db, "reingresos", idReingresoEnEdicion), datosActualizados);
+
+                    correlativoFinal = baseDatosReingresos.find(r => r.id === idReingresoEnEdicion)?.correlativo;
+                    datosParaPDF = { ...datosActualizados, correlativo: correlativoFinal };
                     Swal.fire({ icon: 'success', title: 'Reingreso Actualizado', text: 'Los cambios se guardaron correctamente.' });
                 } else {
-                    const correlativo = await obtenerSiguienteCorrelativoReingreso();
-                    const datos = {
-                        correlativo,
-                        fecha: document.getElementById('re-fecha').value,
-                        solicitante: document.getElementById('re-solicitante').value,
-                        local: document.getElementById('re-local').value,
-                        entregado: document.getElementById('re-entregado').value,
-                        expedientes,
+                    const datosBase = {
+                        fecha, solicitante, local, entregado, expedientes,
                         createdAt: Date.now(),
                         activo: true,
                         auditoria: {
@@ -1714,19 +1746,64 @@
                         }
                     };
 
-                    await addDoc(collection(db, "reingresos"), datos);
+                    const resultado = await guardarReingresoConCorrelativoAtomico(datosBase);
+                    correlativoFinal = resultado.correlativo;
+                    datosParaPDF = resultado.datos;
                     Swal.fire({ icon: 'success', title: 'Registro guardado con éxito' });
                 }
+
+                // El PDF se genera SIEMPRE a partir de datos que ya están
+                // confirmados en Firestore, nunca de un correlativo calculado
+                // localmente antes de guardar.
+                await construirPDFReingreso({
+                    correlativo: correlativoFinal,
+                    fecha: datosParaPDF.fecha,
+                    solicitante: datosParaPDF.solicitante,
+                    local: datosParaPDF.local,
+                    entregado: datosParaPDF.entregado,
+                    expedientes: datosParaPDF.expedientes
+                });
 
                 resetFormularioReingreso();
                 await cargarHistorialReingresosParaDashboard();
                 switchView('view-consultas-reingresos', 'Consultar Historial de Reingresos');
             } catch (e) {
                 Swal.fire('Error', e.message, 'error');
+            } finally {
+                [btnGuardar, btnGenerarPDF].forEach(b => b?.removeAttribute('disabled'));
             }
-        };
+        }
 
-        window.guardarTraslado = async function() {
+        // Ambos botones ("Guardar Registro" y "Generar PDF") ejecutan el mismo
+        // flujo seguro: guardar en Firestore y luego mostrar el PDF ya confirmado.
+        window.guardarReingreso = procesarYGuardarReingreso;
+
+        // Igual que con reingresos: correlativo + creación del documento en una
+        // sola transacción atómica, para que nunca exista un correlativo que no
+        // corresponda a un registro realmente grabado en Firestore.
+        async function guardarTrasladoConCorrelativoAtomico(datosBase) {
+            const contadorRef = doc(db, "contadores", "traslados");
+            const nuevoDocRef = doc(collection(db, "traslados"));
+
+            const resultado = await runTransaction(db, async (transaction) => {
+                const contadorSnap = await transaction.get(contadorRef);
+                const nuevoValor = (contadorSnap.exists() ? Number(contadorSnap.data().valor) || 0 : 0) + 1;
+
+                const datosCompletos = { ...datosBase, correlativo: nuevoValor };
+
+                transaction.set(contadorRef, { valor: nuevoValor });
+                transaction.set(nuevoDocRef, datosCompletos);
+
+                return { id: nuevoDocRef.id, correlativo: nuevoValor, datos: datosCompletos };
+            });
+
+            return resultado;
+        }
+
+        // Fusiona "Guardar Traslado" y "Generar PDF": primero se guarda (con
+        // correlativo atómico si es nuevo) y el PDF se arma con los datos ya
+        // confirmados en Firestore, nunca antes de guardar.
+        async function procesarYGuardarTraslado() {
             const fecha = document.getElementById('tr-fecha').value;
             const entregado = document.getElementById('tr-entregado').value;
             const recibe = document.getElementById('tr-recibe').value;
@@ -1757,16 +1834,19 @@
                 return;
             }
 
+            const btnGuardar = document.getElementById('btn-guardar-traslado');
+            const btnGenerarPDF = document.querySelector('button[onclick="generarReporteTrasladoPDF()"]');
+            [btnGuardar, btnGenerarPDF].forEach(b => b?.setAttribute('disabled', 'true'));
+
             try {
                 const currentUserObj = auth.currentUser;
                 const currentUserName = currentUserObj ? (currentUserObj.displayName ? normalizarTexto(currentUserObj.displayName) : normalizarTexto(currentUserObj.email.split('@')[0])) : 'DESCONOCIDO';
 
+                let correlativoFinal, datosParaPDF;
+
                 if (idTrasladoEnEdicion) {
                     const datosActualizados = {
-                        fecha,
-                        entregado,
-                        recibe,
-                        paquetes,
+                        fecha, entregado, recibe, paquetes,
                         auditoriaEdicion: {
                             uid: currentUserObj?.uid || null,
                             nombre: currentUserName,
@@ -1775,15 +1855,13 @@
                     };
 
                     await updateDoc(doc(db, "traslados", idTrasladoEnEdicion), datosActualizados);
+
+                    correlativoFinal = baseDatosTraslados.find(r => r.id === idTrasladoEnEdicion)?.correlativo;
+                    datosParaPDF = { ...datosActualizados, correlativo: correlativoFinal };
                     Swal.fire({ icon: 'success', title: 'Traslado Actualizado', text: 'Los cambios se guardaron correctamente.' });
                 } else {
-                    const correlativo = await obtenerSiguienteCorrelativoTraslado();
-                    const datos = {
-                        correlativo,
-                        fecha,
-                        entregado,
-                        recibe,
-                        paquetes,
+                    const datosBase = {
+                        fecha, entregado, recibe, paquetes,
                         createdAt: Date.now(),
                         activo: true,
                         auditoria: {
@@ -1793,17 +1871,31 @@
                         }
                     };
 
-                    await addDoc(collection(db, "traslados"), datos);
+                    const resultado = await guardarTrasladoConCorrelativoAtomico(datosBase);
+                    correlativoFinal = resultado.correlativo;
+                    datosParaPDF = resultado.datos;
                     Swal.fire({ icon: 'success', title: 'Formato de traslado guardado con éxito' });
                 }
+
+                await construirPDFTraslado({
+                    correlativo: correlativoFinal,
+                    fecha: datosParaPDF.fecha,
+                    entregado: datosParaPDF.entregado,
+                    recibe: datosParaPDF.recibe,
+                    paquetes: datosParaPDF.paquetes
+                });
 
                 resetFormularioTraslado();
                 await cargarHistorialTrasladosParaDashboard();
                 switchView('view-consultas-traslados', 'Consultar Historial de Traslados');
             } catch (e) {
                 Swal.fire('Error', e.message, 'error');
+            } finally {
+                [btnGuardar, btnGenerarPDF].forEach(b => b?.removeAttribute('disabled'));
             }
-        };
+        }
+
+        window.guardarTraslado = procesarYGuardarTraslado;
 
         window.editarReingreso = function(id) {
             const registro = baseDatosReingresos.find(r => r.id === id);
@@ -1869,25 +1961,14 @@
             switchView('view-traslados', `Editando Traslado N° ${registro.correlativo}`);
         };
 
-        async function obtenerSiguienteCorrelativoReingreso() {
-            const snapshotActual = await getDocs(collection(db, "reingresos"));
-            let maxCorrelativo = 0;
-            snapshotActual.forEach((docSnap) => {
-                const c = Number(docSnap.data().correlativo) || 0;
-                if (c > maxCorrelativo) maxCorrelativo = c;
-            });
-            return maxCorrelativo + 1;
-        }
-
-        async function obtenerSiguienteCorrelativoTraslado() {
-            const snapshotActual = await getDocs(collection(db, "traslados"));
-            let maxCorrelativo = 0;
-            snapshotActual.forEach((docSnap) => {
-                const c = Number(docSnap.data().correlativo) || 0;
-                if (c > maxCorrelativo) maxCorrelativo = c;
-            });
-            return maxCorrelativo + 1;
-        }
+        // NOTA: las antiguas obtenerSiguienteCorrelativoReingreso() y
+        // obtenerSiguienteCorrelativoTraslado() (contar documentos con getDocs
+        // y sumar 1) fueron eliminadas. Esa lógica calculaba el correlativo
+        // fuera de cualquier transacción y de forma desacoplada del guardado,
+        // lo que producía los "correlativos fantasma" del bug original. Ahora
+        // el correlativo se calcula y confirma atómicamente junto con la
+        // creación del documento en guardarReingresoConCorrelativoAtomico() /
+        // guardarTrasladoConCorrelativoAtomico().
 
         window.eliminarReingreso = async function(id) {
             const registro = baseDatosReingresos.find(r => r.id === id);
@@ -2231,63 +2312,13 @@
             mostrarModalPreviewPDF(blobUrl, `TRASLADO_${String(correlativo).padStart(3, '0')}_${fecha}.pdf`);
         }
 
-        window.generarReporteReingresoPDF = async function() {
-            const expedientes = Array.from(document.querySelectorAll("#tabla-reingresos tbody tr")).map(tr => {
-                const inputs = tr.querySelectorAll('input, select');
-                return { paquete: inputs[0].value, exp: inputs[1].value, folios: inputs[2].value, juzgado: inputs[3].value, tipo: inputs[4].value, acomp: inputs[5].value };
-            });
-
-            if (expedientes.length === 0) {
-                Swal.fire('Atención', 'Agregue al menos un expediente antes de generar el reporte.', 'warning');
-                return;
-            }
-
-            await construirPDFReingreso({
-                correlativo: idReingresoEnEdicion ? baseDatosReingresos.find(r => r.id === idReingresoEnEdicion)?.correlativo : await obtenerSiguienteCorrelativoReingreso(),
-                fecha: document.getElementById('re-fecha').value,
-                solicitante: document.getElementById('re-solicitante').value,
-                local: document.getElementById('re-local').value,
-                entregado: document.getElementById('re-entregado').value,
-                expedientes
-            });
-        };
-
-        window.generarReporteTrasladoPDF = async function() {
-            const recibe = document.getElementById('tr-recibe').value;
-            if (!recibe) {
-                Swal.fire('Atención', 'Seleccione quién recibe antes de generar el reporte.', 'warning');
-                return;
-            }
-
-            const paquetes = Array.from(document.querySelectorAll("#tabla-traslados tbody tr")).map(tr => {
-                const desde = tr.querySelector('.tr-desde').value.trim();
-                const hasta = tr.querySelector('.tr-hasta').value.trim();
-                const inputs = tr.querySelectorAll('input, select');
-                return { 
-                    paqueteDesde: desde,
-                    paqueteHasta: hasta || desde,
-                    rangoTexto: hasta && hasta !== desde ? `${desde} al ${hasta}` : desde,
-                    cantidad: parseInt(tr.querySelector('.tr-cant').textContent, 10) || 1,
-                    juzgado: inputs[2].value, 
-                    repoSalida: inputs[3].value, 
-                    repoIngreso: inputs[4].value, 
-                    motivo: inputs[5].value 
-                };
-            });
-
-            if (paquetes.length === 0) {
-                Swal.fire('Atención', 'Agregue al menos un rango de paquetes antes de generar el reporte de traslado.', 'warning');
-                return;
-            }
-
-            await construirPDFTraslado({
-                correlativo: idTrasladoEnEdicion ? baseDatosTraslados.find(r => r.id === idTrasladoEnEdicion)?.correlativo : await obtenerSiguienteCorrelativoTraslado(),
-                fecha: document.getElementById('tr-fecha').value,
-                entregado: document.getElementById('tr-entregado').value,
-                recibe,
-                paquetes
-            });
-        };
+        // IMPORTANTE: "Generar PDF" ya NO calcula un correlativo aparte ni arma
+        // el PDF de forma independiente del guardado. Apunta al mismo flujo que
+        // "Guardar Registro" (guardar en Firestore primero, PDF después) para
+        // que sea imposible que exista un PDF con un correlativo que no llegó
+        // a grabarse en la base de datos.
+        window.generarReporteReingresoPDF = procesarYGuardarReingreso;
+        window.generarReporteTrasladoPDF = procesarYGuardarTraslado;
 
         window.generarPDFReingresoDesdeRegistro = async function(id) {
             const registro = baseDatosReingresos.find(r => r.id === id);
